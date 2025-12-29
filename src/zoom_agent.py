@@ -53,6 +53,7 @@ class ExpansionStep:
     uncertainty_after: float
     tokens_used: int
     visible_nodes_count: int
+    surprise_score: float = 0.0
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -61,6 +62,7 @@ class ExpansionStep:
             "expanded": self.expanded_node_id,
             "summary": self.expanded_node_summary[:100],
             "info_gain": round(self.information_gain, 4),
+            "surprise": round(self.surprise_score, 4),
             "uncertainty_before": round(self.uncertainty_before, 4),
             "uncertainty_after": round(self.uncertainty_after, 4),
             "tokens": self.tokens_used,
@@ -297,6 +299,7 @@ class UncertaintyZoomAgent:
                 uncertainty_after=post_estimate.entropy,
                 tokens_used=tokens_used,
                 visible_nodes_count=len(visible_nodes),
+                surprise_score=best_ig.surprise_score,
             ))
             
             step += 1

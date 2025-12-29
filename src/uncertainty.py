@@ -86,6 +86,7 @@ class InformationGainEstimate:
         predicted_uncertainty: Predicted uncertainty after expansion
         child_diversity: Semantic diversity of children
         relevance_score: Base relevance to the query
+        surprise_score: Novelty relative to current context (Titans logic)
     """
     node_id: str
     expected_ig: float
@@ -93,24 +94,23 @@ class InformationGainEstimate:
     predicted_uncertainty: float
     child_diversity: float
     relevance_score: float
+    surprise_score: float = 0.0
     
     @property
     def combined_score(self) -> float:
         """Combined score for ranking nodes."""
-        # Weighted combination of information gain and relevance
-        return 0.7 * self.expected_ig + 0.3 * self.relevance_score
+        # Weighted combination: Relevance + Info Gain + Surprise (Titans logic)
+        # Surprise acts as a "curiosity" bonus for novel information
+        return (
+            0.5 * self.expected_ig + 
+            0.3 * self.relevance_score + 
+            0.2 * self.surprise_score
+        )
 
 
 class UncertaintyEstimator:
     """
     Estimates epistemic uncertainty of an SLM's answers.
-    
-    This is the core innovation that distinguishes our approach from RAPTOR/MemTree.
-    Instead of just scoring relevance, we measure how uncertain the model is
-    about its answer given the current visible context.
-    
-    Key insight: If the model is confident, we can stop early. If uncertain,
-    we should expand nodes with high information gain (potential to reduce uncertainty).
     """
     
     def __init__(
@@ -119,19 +119,9 @@ class UncertaintyEstimator:
         max_entropy_threshold: float = 2.0,
         use_calibration: bool = True,
     ):
-        """
-        Initialize the uncertainty estimator.
-        
-        Args:
-            confidence_threshold: Minimum confidence to consider "confident"
-            max_entropy_threshold: Maximum entropy to consider "confident"
-            use_calibration: Whether to apply calibration correction
-        """
         self.confidence_threshold = confidence_threshold
         self.max_entropy_threshold = max_entropy_threshold
         self.use_calibration = use_calibration
-        
-        # Calibration history for adjustment
         self.calibration_history: List[Tuple[float, bool]] = []
     
     def estimate_uncertainty(
@@ -141,22 +131,6 @@ class UncertaintyEstimator:
         context: str,
         max_answer_tokens: int = 100,
     ) -> UncertaintyEstimate:
-        """
-        Estimate uncertainty of the answer given query and context.
-        
-        Uses token-level log probabilities to compute:
-        1. Average entropy across answer tokens
-        2. Confidence (exp of average log prob)
-        
-        Args:
-            llm: The language model interface
-            query: The user's question
-            context: The current visible context (node summaries)
-            max_answer_tokens: Maximum tokens for the answer
-        
-        Returns:
-            UncertaintyEstimate with entropy, confidence, and answer
-        """
         # Construct prompt
         prompt = self._build_qa_prompt(query, context)
         
@@ -164,26 +138,20 @@ class UncertaintyEstimator:
         answer, log_probs = llm.generate_with_logprobs(prompt, max_answer_tokens)
         
         if not log_probs:
-            # Fallback if no log probs available
             return UncertaintyEstimate(
-                entropy=5.0,  # High uncertainty
+                entropy=5.0,
                 confidence=0.5,
                 answer=answer,
                 token_entropies=[],
                 is_confident=False,
             )
         
-        # Compute entropy from log probs
-        # Entropy ≈ -log_prob (for the selected token)
-        # This is a lower bound on true entropy
         token_entropies = [-lp for lp in log_probs]
         avg_entropy = sum(token_entropies) / len(token_entropies)
         
-        # Compute confidence as exp of average log prob
         avg_log_prob = sum(log_probs) / len(log_probs)
         confidence = math.exp(avg_log_prob)
         
-        # Apply calibration if enabled
         if self.use_calibration and len(self.calibration_history) >= 10:
             confidence = self._apply_calibration(confidence)
         
@@ -211,41 +179,20 @@ class UncertaintyEstimator:
         current_uncertainty: float,
     ) -> InformationGainEstimate:
         """
-        Estimate information gain from expanding a specific node.
-        
-        Information Gain = Current Uncertainty - Expected Uncertainty After Expansion
-        
-        This is computed by:
-        1. Measuring current uncertainty
-        2. Estimating how much the node content might reduce uncertainty
-        3. Weighting by child diversity (more diverse = more potential info)
-        
-        Args:
-            llm: The language model interface
-            query: The user's question
-            current_context: Current visible context
-            node_summary: Summary of the node being evaluated
-            node_id: ID of the node
-            child_diversity: Semantic diversity of the node's children
-            current_uncertainty: Current entropy value
-        
-        Returns:
-            InformationGainEstimate with expected IG and scores
+        Estimate information gain with Titans-inspired 'Surprise' metric.
         """
-        # Compute relevance of node to query
+        # 1. Relevance: How well does this match the query?
         relevance = self._compute_relevance(llm, query, node_summary)
         
-        # Estimate post-expansion uncertainty
-        # Key insight: Higher relevance and higher diversity = more potential reduction
-        # This is a heuristic; exact computation would require expanding and measuring
+        # 2. Surprise (Titans logic): How different is this from what we already see?
+        # High surprise = High potential for new information
+        surprise = self._compute_surprise(llm, current_context, node_summary)
         
-        # Expected uncertainty reduction is proportional to:
-        # - How relevant the node is (if irrelevant, won't help)
-        # - How diverse the children are (more options = better chance of finding answer)
+        # 3. Reduction Factor: Unifies Relevance, Diversity, and Surprise
+        # We want nodes that are Relevant AND (Diverse OR Surprising)
+        reduction_factor = relevance * (0.4 + 0.3 * child_diversity + 0.3 * surprise)
         
-        reduction_factor = relevance * (0.5 + 0.5 * child_diversity)
-        predicted_uncertainty = current_uncertainty * (1.0 - reduction_factor * 0.3)
-        
+        predicted_uncertainty = current_uncertainty * (1.0 - reduction_factor * 0.4)
         expected_ig = max(0.0, current_uncertainty - predicted_uncertainty)
         
         return InformationGainEstimate(
@@ -255,7 +202,38 @@ class UncertaintyEstimator:
             predicted_uncertainty=predicted_uncertainty,
             child_diversity=child_diversity,
             relevance_score=relevance,
+            surprise_score=surprise,
         )
+    
+    def _compute_surprise(
+        self,
+        llm: LLMInterface,
+        context: str,
+        node_summary: str,
+    ) -> float:
+        """
+        Compute 'Surprise' metric based on semantic dissimilarity to context.
+        
+        Inspired by Titans/Neural Memory: We attend to what is surprising (novel).
+        If a node is very similar to current context, it has low surprise (redundant).
+        If it is very different, it has high surprise (novel).
+        """
+        if not context.strip():
+            return 1.0  # Everything is surprising if context is empty
+            
+        context_emb = llm.embed(context[:500])  # Embed partial context
+        node_emb = llm.embed(node_summary)
+        
+        dot_product = np.dot(context_emb, node_emb)
+        norm = np.linalg.norm(context_emb) * np.linalg.norm(node_emb)
+        cosine_sim = dot_product / (norm + 1e-8)
+        
+        # Surprise is the inverse of similarity
+        # Map similarity [-1, 1] to surprise [0, 1]
+        # Sim 1.0 -> Surprise 0.0
+        # Sim 0.0 -> Surprise 0.5
+        # Sim -1.0 -> Surprise 1.0
+        return 1.0 - (cosine_sim + 1.0) / 2.0
     
     def _compute_relevance(
         self,

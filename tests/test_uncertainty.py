@@ -146,8 +146,8 @@ class TestInformationGainEstimate:
             relevance_score=0.8,
         )
         
-        # Combined = 0.7 * IG + 0.3 * relevance
-        expected = 0.7 * 0.5 + 0.3 * 0.8
+        # Combined = 0.5 * IG + 0.3 * relevance + 0.2 * surprise (default 0)
+        expected = 0.5 * 0.5 + 0.3 * 0.8 + 0.2 * 0.0
         assert abs(ig.combined_score - expected) < 0.01
 
 
